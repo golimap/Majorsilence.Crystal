@@ -1,0 +1,324 @@
+// Turns Crystal's "data only" Excel export into a visual-regression data fixture.
+//
+// This is the second half of a two-step, dev-machine-only pipeline. The first half needs
+// the real Crystal runtime and so lives in the net48 ReferenceRenderer; this half needs
+// our own parser and so lives here:
+//
+//   ReferenceRenderer --xls  <report>.rpt  <report>.xls
+//   FixtureBuilder           <report>.rpt  <report>.xls  tests/reference-data/<report>.csv
+//
+// Why the Excel export rather than the CSV one the first fixture came from: Crystal's CSV
+// export writes *rendered* rows, so every line carries the whole report line - headers,
+// labels, detail values, footers - and the detail columns are only recoverable when the
+// report is a plain list. The data-only Excel export writes a cell grid instead, which
+// survives grouping.
+//
+// What it still cannot do: the export contains what the report *displays*. A report that
+// suppresses its detail section and shows only group summaries or a cross-tab exports
+// those summaries, and the underlying rows are nowhere in it. Those reports need the rows
+// saved inside the .rpt itself, which is a separate unsolved problem (see BACKLOG).
+//
+// The output is committed, so read the summary this prints before committing it: the row
+// count and the first row are exactly the things a mis-parse gets wrong. The row count is
+// checked against the one the report was saved with whenever that can be read; the first
+// row never is.
+
+using System.Globalization;
+using System.Text;
+using Majorsilence.Crystal.Model.Fields;
+using Majorsilence.Crystal.Parser;
+
+// --grid prints the export's cells row by row, as the reader sees them. When a report will not
+// build, this is the thing to look at: which rows exist, how wide each is, and which columns
+// its values sit in.
+if (args.Length == 2 && args[0] == "--grid")
+{
+    var cells = Majorsilence.Crystal.FixtureBuilder.Biff.ReadGrid(args[1]);
+    foreach (var row in cells.GroupBy(kv => kv.Key.Row).OrderBy(g => g.Key))
+        Console.WriteLine($"{row.Key,4} [{row.Count(),2}] " + string.Join(" | ",
+            row.OrderBy(kv => kv.Key.Col).Select(kv =>
+                $"{kv.Key.Col}={Convert.ToString(kv.Value, CultureInfo.InvariantCulture)}")));
+    return 0;
+}
+
+if (args.Length < 3)
+{
+    Console.Error.WriteLine("Usage: FixtureBuilder <rpt-path> <xls-path> <out-csv-path>");
+    Console.Error.WriteLine("       FixtureBuilder --grid <xls-path>");
+    return 1;
+}
+
+string rptPath = args[0], xlsPath = args[1], outPath = args[2];
+foreach (var p in new[] { rptPath, xlsPath })
+{
+    if (File.Exists(p)) continue;
+    Console.Error.WriteLine($"Not found: {p}");
+    return 1;
+}
+
+// ---------------------------------------------------------------- field list
+var parsed = RptParser.Parse(rptPath);
+if (!parsed.Success || parsed.Report is null)
+{
+    Console.Error.WriteLine("Parse failed");
+    return 1;
+}
+
+var fields = parsed.Report.Fields.OfType<DatabaseField>().ToList();
+if (fields.Count == 0)
+{
+    Console.Error.WriteLine("No database fields; nothing a fixture could hold");
+    return 1;
+}
+Console.WriteLine($"fields ({fields.Count}): " +
+    string.Join(", ", fields.Select(f => $"{f.Name}:{f.DataType}")));
+
+// ------------------------------------------------------------------ the grid
+var grid = Majorsilence.Crystal.FixtureBuilder.Biff.ReadGrid(xlsPath);
+if (grid.Count == 0)
+{
+    Console.Error.WriteLine("No cells in the export");
+    return 1;
+}
+
+// Two views of each exported row, because both are needed.
+//
+// The compacted one - values in column order with the gaps closed - is what the shape
+// vote below works on, and it is the right view for a row that is not a detail row: a
+// group subtotal alone on its line lands in column 0 regardless of which column it is
+// printed under, so its index says nothing.
+//
+// The indexed one keeps each value at its own column, which is what recovers a detail
+// row carrying a null. A BIFF row omits an empty cell, so a product with no Color
+// exports as columns [0,1,3,4] rather than [0,1,2,3,4] - the value is not missing from
+// the row, the *column* is missing, and compacting slides Size and Price one place left.
+// Those rows used to be dropped for being short: 39 of ProductPriceList's 115.
+int maxRow = grid.Keys.Max(k => k.Row);
+
+// The export's columns are whatever the report *displays*, and the field list here is its
+// database columns - the two are not the same thing. ProductPriceList_xs shows a formula
+// column, "Num. Xs", between Size and Price: six exported columns against five fields. Read
+// positionally, its rows land one place off from Color onwards, and the rows that happened
+// to have five values (no Color) passed the width test and were written out with
+// Color="xsm" and Size="1". A misaligned fixture is worse than none, so the columns are
+// matched by the labels the export itself carries wherever those map cleanly onto the
+// fields, and a column no field claims - the formula one - is skipped.
+//
+// Only when every field is claimed exactly once. Plenty of reports have no usable label row
+// (SalesByCustomer-Grouped labels only two of its three columns, the third being the group
+// name), and those keep the positional reading.
+var fieldIndexByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+for (int i = 0; i < fields.Count; i++) fieldIndexByName[fields[i].Name] = i;
+
+int[]? columnToField = null;
+for (int r = 0; r <= maxRow && columnToField is null; r++)
+{
+    var cells = grid.Where(kv => kv.Key.Row == r).OrderBy(kv => kv.Key.Col).ToList();
+    if (cells.Count < fields.Count) continue;
+
+    int maxCol = cells.Max(kv => kv.Key.Col);
+    var map = new int[maxCol + 1];
+    Array.Fill(map, -1);
+    var claimed = new bool[fields.Count];
+    int hits = 0;
+    foreach (var kv in cells)
+    {
+        if (kv.Value is not string label) continue;
+        if (!fieldIndexByName.TryGetValue(label.Trim(), out int fi)) continue;
+        if (claimed[fi]) continue;
+        map[kv.Key.Col] = fi;
+        claimed[fi] = true;
+        hits++;
+    }
+    if (hits != fields.Count) continue;
+
+    // A label row's columns are not always the data's columns. This export flattens
+    // whatever each section printed, so a label row that also carries the print date has
+    // its labels pushed one place right while the detail rows below start at column 0 -
+    // boyum__SampleReport does exactly that, labelling columns 1 and 2 for data that
+    // lives in 0 and 1. Trusting that map drops every row. So the map only counts if the
+    // data reaches the last column it claims.
+    int lastMapped = Array.FindLastIndex(map, fi => fi >= 0);
+    bool dataReachesIt = grid.Keys.Any(k => k.Row != r && k.Col == lastMapped);
+    if (!dataReachesIt)
+    {
+        Console.WriteLine($"labels on row {r} claim up to col{lastMapped}, which no other row "
+            + "fills - reading positionally instead");
+        continue;
+    }
+
+    columnToField = map;
+    Console.WriteLine($"column map from the export's labels on row {r}: "
+        + string.Join(", ", map.Select((fi, c) => fi < 0 ? $"col{c}=skip" : $"col{c}={fields[fi].Name}")));
+}
+if (columnToField is null)
+    Console.WriteLine("no usable label row; reading export columns positionally");
+
+var rows = new List<List<object>>();
+var indexed = new List<object?[]>();
+for (int r = 0; r <= maxRow; r++)
+{
+    var cells = grid.Where(kv => kv.Key.Row == r).OrderBy(kv => kv.Key.Col).ToList();
+
+    var slots = new object?[fields.Count];
+    foreach (var kv in cells)
+    {
+        int fi = columnToField is not null
+            ? (kv.Key.Col < columnToField.Length ? columnToField[kv.Key.Col] : -1)
+            : (kv.Key.Col < fields.Count ? kv.Key.Col : -1);
+        if (fi >= 0) slots[fi] = kv.Value;
+    }
+    indexed.Add(slots);
+
+    // The compacted view drops any column the map skipped, so the width test below counts
+    // the values that belong to fields rather than everything the report printed.
+    rows.Add(columnToField is not null
+        ? slots.Where(v => v is not null).Select(v => v!).ToList()
+        : cells.Select(kv => kv.Value).ToList());
+}
+
+// A detail row is one that has a value for every field and whose values are the right
+// *kinds* of value. That is what separates it from the label row above it, which is the
+// same width but all text where the detail row has numbers - and it needs no knowledge of
+// what the labels say, so it is not defeated by a label that reads like a field name.
+static string Shape(IEnumerable<object> vals) =>
+    string.Concat(vals.Select(v => v is double ? "n" : "s"));
+
+// A cell holding a field's own name is a column label, not a value. Some report shapes
+// repeat the page-header labels on every exported line, and those rows are the same
+// width and the same all-text shape as a detail row - so the shape vote alone elects
+// them and the fixture comes out holding the words "Order Amount" where every amount
+// should be. Half the cells matching a field name is far past coincidence; one product
+// genuinely called "Color" cannot reach it.
+var fieldNames = fields.Select(f => f.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+bool LooksLikeLabelRow(List<object> r) =>
+    r.Count(v => v is string s && fieldNames.Contains(s.Trim())) * 2 >= r.Count;
+
+var fullWidth = rows.Where(r => r.Count == fields.Count).ToList();
+var candidates = fullWidth.Where(r => !LooksLikeLabelRow(r)).ToList();
+if (fullWidth.Count != candidates.Count)
+    Console.WriteLine($"ignored {fullWidth.Count - candidates.Count} full-width row(s) whose " +
+        "cells are this report's own field names rather than values");
+
+if (candidates.Count == 0)
+{
+    Console.Error.WriteLine(
+        $"No exported row has {fields.Count} values that are not column labels. Widths present: " +
+        string.Join(", ", rows.Select(r => r.Count).Distinct().OrderBy(x => x)) +
+        ". The report probably suppresses its detail section, in which case the rows are " +
+        "not in the export at all.");
+    return 1;
+}
+
+var byShape = candidates.GroupBy(Shape).OrderByDescending(g => g.Count()).ToList();
+string detailShape = byShape[0].Key;
+Console.WriteLine("row shapes at full width: " +
+    string.Join(", ", byShape.Select(g => $"{g.Key} x{g.Count()}")));
+Console.WriteLine($"taking '{detailShape}' as the detail rows");
+
+// Now take back the rows a null pushed out of that vote. A short row is a detail row when
+// every value it does have is the right kind for the column it sits in, and it fills at
+// least half its columns - which is what separates it from a group subtotal, a single
+// number alone in column 0 that would otherwise match the first character of the shape and
+// nothing else. Anything reading as a label row is still refused.
+static string ShapeOf(object?[] slots) =>
+    string.Concat(slots.Select(v => v is null ? "-" : v is double ? "n" : "s"));
+
+bool FitsDetailShape(object?[] slots)
+{
+    int filled = 0;
+    for (int i = 0; i < slots.Length; i++)
+    {
+        if (slots[i] is null) continue;
+        filled++;
+        char kind = slots[i] is double ? 'n' : 's';
+        if (detailShape[i] != kind) return false;
+    }
+    return filled * 2 >= slots.Length;
+}
+
+var detail = new List<List<object>>();
+int recovered = 0;
+for (int r = 0; r < indexed.Count; r++)
+{
+    var slots = indexed[r];
+    bool isFull = rows[r].Count == fields.Count;
+
+    if (isFull)
+    {
+        if (Shape(rows[r]) == detailShape && !LooksLikeLabelRow(rows[r]))
+            detail.Add(rows[r]);
+        continue;
+    }
+    if (rows[r].Count == 0) continue;
+    if (LooksLikeLabelRow(rows[r])) continue;
+    if (!FitsDetailShape(slots)) continue;
+
+    // Nulls become empty strings, which the fixture reader turns back into DBNull.
+    detail.Add(slots.Select(v => v ?? (object)string.Empty).ToList());
+    recovered++;
+}
+
+if (recovered > 0)
+    Console.WriteLine($"recovered {recovered} row(s) that a null had pushed out of the shape vote "
+        + $"(shapes: {string.Join(", ", indexed.Where((s, i) => rows[i].Count > 0 && rows[i].Count != fields.Count).Select(ShapeOf).Distinct().Take(4))})");
+
+// The report says how many rows it was saved with, and the export is of exactly those rows,
+// so a fixture holding any other number has lost or invented some. Neither shows up as an
+// error anywhere downstream: a fixture short of rows renders a shorter report than the
+// reference it is measured against, and the gap reads as a layout fault. So a mismatch is
+// refused rather than written. All nine committed fixtures match their reports' counts.
+if (parsed.SavedRowCount is int saved)
+{
+    if (detail.Count != saved)
+    {
+        Console.Error.WriteLine(
+            $"Recovered {detail.Count} detail rows, but the report was saved with {saved}. "
+            + "Not writing a fixture that is missing or inventing rows.");
+        return 1;
+    }
+    Console.WriteLine($"row count matches the {saved} rows the report was saved with");
+}
+else
+{
+    Console.WriteLine("the report's saved row count could not be confirmed, so the row count "
+        + "below is unchecked - read it before committing");
+}
+
+// -------------------------------------------------------------------- output
+// Excel keeps dates as a day count from 1899-12-30. Left as a number, a date column
+// formats as "37037" and the comparison is against a rendered date, so convert the
+// columns the report itself calls dates.
+static bool IsDateField(DatabaseField f) =>
+    f.DataType.Contains("date", StringComparison.OrdinalIgnoreCase);
+
+var epoch = new DateTime(1899, 12, 30, 0, 0, 0, DateTimeKind.Unspecified);
+
+var sb = new StringBuilder();
+sb.AppendLine(string.Join(",", fields.Select(f => Quote(f.Name))));
+foreach (var row in detail)
+{
+    var cells = new List<string>(fields.Count);
+    for (int i = 0; i < fields.Count; i++)
+    {
+        object v = row[i];
+        if (v is double d && IsDateField(fields[i]))
+            cells.Add(Quote(epoch.AddDays(d).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
+        else if (v is double n)
+            cells.Add(Quote(n.ToString("R", CultureInfo.InvariantCulture)));
+        else
+            cells.Add(Quote(Convert.ToString(v, CultureInfo.InvariantCulture) ?? ""));
+    }
+    sb.AppendLine(string.Join(",", cells));
+}
+
+Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
+File.WriteAllText(outPath, sb.ToString());
+
+Console.WriteLine($"wrote {outPath}: {detail.Count} rows");
+Console.WriteLine("  header: " + string.Join(" | ", fields.Select(f => f.Name)));
+if (detail.Count > 0)
+    Console.WriteLine("  first:  " + string.Join(" | ", detail[0].Select(v => Convert.ToString(v, CultureInfo.InvariantCulture))));
+return 0;
+
+static string Quote(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";

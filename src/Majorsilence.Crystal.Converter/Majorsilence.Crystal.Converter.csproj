@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Majorsilence.Crystal.Model\Majorsilence.Crystal.Model.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Irony" Version="1.5.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>RDL emitter and Crystal formula transpiler (Irony grammar) that converts a parsed .rpt report into SSRS 2005 RDL XML. Part of Majorsilence.Crystal, which reads .rpt files and converts them to SSRS RDL without the SAP Crystal Reports runtime.</Description>
+  </PropertyGroup>
+
+</Project>

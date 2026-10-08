@@ -1,0 +1,6 @@
+{
+  "inputDirectory": "C:\\VS2026\\majorsilence.crystal\\reports",
+  "outputDirectory": "C:\\VS2026\\majorsilence.crystal\\working-dir\\migrated",
+  "logDirectory": "C:\\VS2026\\majorsilence.crystal\\logs",
+  "recursive": true
+}

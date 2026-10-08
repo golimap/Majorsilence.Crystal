@@ -1,0 +1,16 @@
+bin/
+obj/
+.vs/
+*.user
+.idea/
+*.suo
+tests/rpt-corpus/
+tests/rpt-corpus/.boyum-downloaded
+# Third-party fixtures fetched by --with-rpt-rs. Never committed: they are
+# another project's test assets, downloaded only to check this parser against.
+tests/rpt-corpus-external/
+.claude/
+*.rptscan.json
+/working-dir
+/reports/
+/logs/

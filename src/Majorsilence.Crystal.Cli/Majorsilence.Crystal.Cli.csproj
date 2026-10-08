@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Majorsilence.Crystal.Converter\Majorsilence.Crystal.Converter.csproj" />
+    <ProjectReference Include="..\Majorsilence.Crystal.Parser\Majorsilence.Crystal.Parser.csproj" />
+    <None Update="migration.config.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Target engine for the `verify` verb: loads converted RDLs to surface schema/expression errors -->
+    <PackageReference Include="Majorsilence.Reporting.RdlEngine.SkiaSharp" Version="26.0.6" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>crystalcli</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>crystalcli</ToolCommandName>
+    <PackageId>Majorsilence.Crystal.Cli</PackageId>
+    <Description>Batch CLI for converting Crystal Reports .rpt files to SSRS RDL and verifying the output against the Majorsilence.Reporting engine.</Description>
+  </PropertyGroup>
+
+  <!-- A tool package bundles the engine's native SkiaSharp and HarfBuzz libraries for every
+       runtime the engine supports, some twenty, which made it 159 MB. Two cuts: the Windows
+       libSkiaSharp.pdb symbol files (256 MB uncompressed, of no use to a user of the tool),
+       and the runtimes nobody runs a conversion tool on (musl, bionic, loongarch, riscv,
+       32-bit). What stays is win-x64, win-arm64, linux-x64, linux-arm64 and osx. -->
+  <Target Name="TrimNativeRuntimes" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.Filename)%(ResolvedFileToPublish.Extension)' == 'libSkiaSharp.pdb'" />
+      <_NativeRuntimeFile Include="@(ResolvedFileToPublish)" Condition="$([System.String]::new('%(ResolvedFileToPublish.RelativePath)').StartsWith('runtimes'))" />
+      <_KeptNativeRuntimeFile Include="@(_NativeRuntimeFile)" Condition="$([System.String]::new('%(_NativeRuntimeFile.RelativePath)').Contains('win-x64'))&#xD;&#xA;                                      Or $([System.String]::new('%(_NativeRuntimeFile.RelativePath)').Contains('win-arm64'))&#xD;&#xA;                                      Or $([System.String]::new('%(_NativeRuntimeFile.RelativePath)').Contains('linux-x64'))&#xD;&#xA;                                      Or $([System.String]::new('%(_NativeRuntimeFile.RelativePath)').Contains('linux-arm64'))&#xD;&#xA;                                      Or $([System.String]::new('%(_NativeRuntimeFile.RelativePath)').Contains('osx'))" />
+      <ResolvedFileToPublish Remove="@(_NativeRuntimeFile)" />
+      <ResolvedFileToPublish Include="@(_KeptNativeRuntimeFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

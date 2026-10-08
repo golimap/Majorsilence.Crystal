@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "Majorsilence.Crystal.Cli": {
+      "commandName": "Project",
+      "commandLineArgs": "convert",
+      "workingDirectory": "C:\\VS2026\\majorsilence.crystal"
+    },
+    "Profile 1": {
+      "commandName": "Project",
+      "commandLineArgs": "convert",
+      "workingDirectory": "C:\\VS2026\\majorsilence.crystal"
+    }
+  }
+}

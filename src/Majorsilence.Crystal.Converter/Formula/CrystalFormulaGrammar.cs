@@ -1,0 +1,324 @@
+using Irony.Parsing;
+
+namespace Majorsilence.Crystal.Converter.Formula;
+
+/// <summary>
+/// Irony grammar for Crystal Reports formula language (Crystal Syntax dialect).
+///
+/// Design notes:
+///   - Binary operators are placed DIRECTLY in expr.Rule (not through an intermediate
+///     non-terminal) so that RegisterOperators() can resolve shift-reduce conflicts.
+///   - Structural keywords (If, Then, Else, Select, Case, Default, Var, Is, To) are
+///     marked as punctuation so they are stripped from the parse tree, leaving only
+///     the semantic children.
+///   - Operator keywords (And, Or, Not, Xor, Mod, Like, In, Eqv, Imp) are NOT marked
+///     as punctuation because the emitter needs to read their values.
+/// </summary>
+[Language("CrystalFormula", "1.0", "Crystal Reports Formula Language")]
+public sealed class CrystalFormulaGrammar : Grammar
+{
+    // ── Rule name constants (used by RdlEmitter to identify nodes) ─────────────
+    public const string ProgramRule        = "program";
+    public const string StmtListRule       = "stmtList";
+    public const string ExprRule           = "expr";
+    public const string IfExprRule         = "ifExpr";
+    public const string SelectExprRule     = "selectExpr";
+    public const string CaseClauseListRule = "caseClauseList";
+    public const string CaseClauseRule     = "caseClause";
+    public const string CaseValueListRule  = "caseValueList";
+    public const string CaseValueRule      = "caseValue";
+    public const string FuncCallRule       = "funcCall";
+    public const string ArgListRule        = "argList";
+    public const string FieldRefTerm       = "fieldRef";
+    public const string NumberTerm         = "number";
+    public const string StringDqTerm       = "strDq";
+    public const string StringSqTerm       = "strSq";
+    public const string DateLitTerm        = "date";
+    public const string IdentTerm          = "id";
+    public const string DottedRefRule      = "dottedRef";
+    public const string AtRefRule          = "atRef";
+    public const string HashRefRule        = "hashRef";
+    public const string SliceExprRule      = "sliceExpr";
+    public const string ArrayLitRule       = "arrayLit";
+    public const string ArrayElemsRule     = "arrayElems";
+    public const string ArrayIndexExprRule = "arrayIndexExpr";
+
+    public CrystalFormulaGrammar() : base(caseSensitive: false)
+    {
+        // ─── Terminals ────────────────────────────────────────────────────────
+        var number   = new NumberLiteral(NumberTerm, NumberOptions.AllowSign);
+        // Irony's NumberLiteral defaults DefaultIntTypes to [Int32] only, so an integer
+        // literal exceeding Int32.MaxValue is a hard PARSE ERROR, not merely a value the
+        // grammar accepts and a later pass has to widen. Confirmed via reflection
+        // (DefaultIntTypes' actual runtime default). A real, deliberate Crystal formula
+        // idiom pads a value to a fixed width by adding a large constant before taking a
+        // substring (CStr({X.Num} + 10000000000)) - 10 billion exceeds Int32.MaxValue
+        // (~2.1 billion). When the grammar fails on this, the *whole* formula falls
+        // through to the regex-fallback transpiler (see FormulaTranspiler.ToRdlExpression:
+        // "let caller fall back"), which has neither this widening nor the grammar's own
+        // trailing-";" handling (program.Rule below) - so a formula that would otherwise
+        // parse cleanly loses both, producing two seemingly separate symptoms (an
+        // "operator works only on numbers"-style failure in the RDL engine, AND a stray
+        // trailing ";" reaching the RDL text unstripped) that actually share this one
+        // cause. Widening to also accept Int64 then Double (in that order) fixes the
+        // literal itself at the source, and lets every other already-working grammar
+        // feature apply normally instead of the formula quietly degrading.
+        number.DefaultIntTypes = [TypeCode.Int32, TypeCode.Int64, TypeCode.Double];
+        var strDq    = new StringLiteral(StringDqTerm, "\"",
+                           StringOptions.AllowsDoubledQuote | StringOptions.AllowsLineBreak);
+        var strSq    = new StringLiteral(StringSqTerm, "'",
+                           StringOptions.AllowsDoubledQuote | StringOptions.AllowsLineBreak);
+        var dateLit  = new RegexBasedTerminal(DateLitTerm, @"#[^#\r\n]+#");
+        var fieldRef = new RegexBasedTerminal(FieldRefTerm, @"\{[^}\r\n]*\}");
+        var id       = new IdentifierTerminal(IdentTerm);
+
+        // ─── Non-terminals ────────────────────────────────────────────────────
+        var program          = new NonTerminal(ProgramRule);
+        var stmtList         = new NonTerminal(StmtListRule);
+        var stmt             = new NonTerminal("stmt");
+        var expr             = new NonTerminal(ExprRule);
+        var primary          = new NonTerminal("primary");
+        var ifExpr           = new NonTerminal(IfExprRule);
+        var selectExpr       = new NonTerminal(SelectExprRule);
+        var caseClauseList   = new NonTerminal(CaseClauseListRule);
+        var caseClause       = new NonTerminal(CaseClauseRule);
+        var caseValueList    = new NonTerminal(CaseValueListRule);
+        var caseValue        = new NonTerminal(CaseValueRule);
+        var funcCall         = new NonTerminal(FuncCallRule);
+        var argList          = new NonTerminal(ArgListRule);
+        var argListOpt       = new NonTerminal("argListOpt");
+        var arg              = new NonTerminal("arg");
+        var arrayLit         = new NonTerminal(ArrayLitRule);
+        var arrayElems       = new NonTerminal(ArrayElemsRule);
+        var arrayIndexExpr   = new NonTerminal(ArrayIndexExprRule);
+        var dottedRef        = new NonTerminal(DottedRefRule);
+        var atRef            = new NonTerminal(AtRefRule);
+        var hashRef          = new NonTerminal(HashRefRule);
+        var sliceExpr        = new NonTerminal(SliceExprRule);
+
+        // ─── Grammar rules ────────────────────────────────────────────────────
+
+        // Crystal terminates statements with ";" and permits a trailing one on the last
+        // statement ("CStr({X.Num}, '#');" is a complete, valid formula). MakePlusRule
+        // only allows ";" *between* statements, so the trailing form has to be spelled
+        // out explicitly or the whole formula fails to parse and falls through to the
+        // regex fallback, which passes the stray ";" straight into the emitted RDL.
+        program.Rule   = stmtList | stmtList + ";";
+        stmtList.Rule  = MakePlusRule(stmtList, ToTerm(";"), stmt);
+
+        // No varDecl rule, deliberately. Crystal's "Local StringVar x := ..." (and its
+        // scopeless "stringvar x := ..." form) declares a local variable, which RDL
+        // expressions have no equivalent for at all — a later "x" reference can't be
+        // emitted as anything meaningful. There *was* a varDecl rule here, but it never
+        // matched: it spelled the declaration as three tokens (scope + type + "Var")
+        // while the lexer reads "StringVar" as a single identifier. That accident is
+        // what makes these formulas work as well as they currently do — the parse fails,
+        // FormulaTranspiler falls through to RegexTranspile, and its CrystalVarDecl
+        // guard degrades the whole formula to "" so the RDL stays valid instead of
+        // fatally referencing an undefined identifier. Making the rule parse would
+        // *bypass* that guard and emit worse output, so the rule is removed rather than
+        // repaired, leaving one mechanism for variable declarations instead of two.
+        stmt.Rule      = expr;
+
+        // Primary atoms
+        primary.Rule   = number
+                       | strDq
+                       | strSq
+                       | dateLit
+                       | fieldRef
+                       | ToTerm("True")
+                       | ToTerm("False")
+                       | ToTerm("Null")
+                       | funcCall
+                       | dottedRef
+                       | atRef
+                       | hashRef
+                       | id
+                       | sliceExpr
+                       | arrayIndexExpr
+                       // A parenthesized *block*, not just a grouped expression — Crystal
+                       // custom-function bodies use "( stmt; stmt; )" with an optional
+                       // trailing semicolon, and the block's value is its last statement
+                       // (which is exactly what the emitter does with stmtList already).
+                       | "(" + stmtList + ")"
+                       | "(" + stmtList + ";" + ")";
+
+        // Crystal string-slice syntax — a postfix "[n]" (single character) or
+        // "[n To m]" (substring, inclusive) on any string-valued primary, e.g.
+        // {Customer.Name}[1 To 3] or {@Formula}[5].
+        sliceExpr.Rule = primary + "[" + expr + "To" + expr + "]"
+                       | primary + "[" + expr + "]";
+
+        // Crystal's array-literal indexing — a standalone "[a, b, c]" immediately
+        // followed by its own "[index]" (1-based, e.g.
+        // ["Sun","Mon",...][Weekday({X.Date})]) — a real, distinct idiom from a
+        // day-name lookup found in a real report. Unambiguous against both existing
+        // bracket forms: unlike sliceExpr this starts with "[" rather than a primary,
+        // and unlike the array literal's own confinement to argument position (see
+        // arrayLit's own comment on why it's not a bare primary/expr), this rule pairs
+        // the literal with its index in one shot rather than exposing a bare array
+        // literal as a general expression value.
+        arrayIndexExpr.Rule = arrayLit + "[" + expr + "]";
+
+        funcCall.Rule    = id + "(" + argListOpt + ")";
+        argListOpt.Rule  = argList | Empty;
+        argList.Rule     = MakePlusRule(argList, ToTerm(","), arg);
+
+        // A function argument is an expression or — and only here — an array literal.
+        arg.Rule         = expr | arrayLit;
+
+        // Crystal's array literal, "[a, b, c]" — written standalone rather than as the
+        // right side of "In". Its only real use is as an argument: Join([{a},{b}], " - ").
+        //
+        // It is deliberately NOT a `primary`/`expr` alternative, which is what keeps it
+        // unambiguous against the two bracket forms the grammar already has:
+        //
+        //   * `sliceExpr` ("primary [ expr ]", "primary [ expr To expr ]") needs a primary
+        //     *before* its "[". Confining the array literal to an argument position means
+        //     the two rules are never both live at the same "[": after a primary only the
+        //     slice is possible, and at the start of an argument only the array is.
+        //     Were the array literal an `expr`, "{X}[1]" would be reducible either way.
+        //
+        //   * `expr In "[" caseValueList "]"` keeps its own inline bracket rule. The "In"
+        //     keyword must be consumed before that "[" is reached, so again only one of
+        //     the two can apply at a given bracket. Spelling the array literal as another
+        //     way to write the right side of "In" — or making it an `expr` so "In expr"
+        //     could match it — is what produces a reduce-reduce conflict between
+        //     caseValueList and the array's element list, since both are comma-separated
+        //     expression lists ending in "]".
+        //
+        // Elements are plain expressions, so this is a flat, single-level list only.
+        // A nested literal ("[[1,2],[3,4]]") is still a parse failure and still falls
+        // through to the regex fallback exactly as it did before — Crystal's own arrays
+        // cannot nest either, and there is nothing in RDL to emit for one.
+        arrayLit.Rule    = "[" + arrayElems + "]";
+        arrayElems.Rule  = MakePlusRule(arrayElems, ToTerm(","), expr);
+
+        // Crystal allows database-field and formula/running-total references without the
+        // {...} bracket wrapper the fieldRef terminal expects — e.g. a formula whose whole
+        // body is just "Customer.Region", "@AnotherFormula", or "#RTotal0". Braced forms
+        // ({Table.Column}, {@Formula}, {?Param}) already work via fieldRef/EmitFieldRef;
+        // these three cover the same references written bare.
+        dottedRef.Rule = id + "." + id;   // Table.Column -> Fields!Column.Value
+        atRef.Rule     = ToTerm("@") + id; // @FormulaName -> Fields!FormulaName.Value
+        hashRef.Rule   = ToTerm("#") + id; // #RunningTotalName -> Fields!RunningTotalName.Value
+
+        // Expressions — operators DIRECTLY in rule so RegisterOperators can see them
+        expr.Rule
+            = expr + "^"   + expr
+            | expr + "*"   + expr
+            | expr + "/"   + expr
+            | expr + "\\"  + expr
+            | expr + "Mod" + expr
+            | expr + "+"   + expr
+            | expr + "-"   + expr
+            | expr + "&"   + expr
+            | expr + "="   + expr
+            | expr + "<>"  + expr
+            | expr + "<"   + expr
+            | expr + ">"   + expr
+            | expr + "<="  + expr
+            | expr + ">="  + expr
+            | expr + "Like" + expr
+            | expr + "In"  + "[" + caseValueList + "]"
+            | expr + "In"  + "(" + caseValueList + ")"
+            // String containment: {X} in "USA" — Crystal's `in` doubles as a substring
+            // test when the right side is a plain value rather than a [list].
+            | expr + "In"  + expr
+            // Bare range test: {X} in A to B — equivalent to (X >= A And X <= B). A
+            // real, distinct Crystal idiom from both the bracketed-list forms above and
+            // the plain string-containment form; found in a real report filtering an
+            // account-group field against two parameter bounds
+            // ({X} in {?FirstGroup} to {?LastGroup}), and previously fell through to the
+            // regex fallback (no rule at all matched "in ... to ...") straight into
+            // invalid RDL text.
+            | expr + "In"  + expr + "To" + expr
+            | expr + "And" + expr
+            | expr + "Xor" + expr
+            | expr + "Or"  + expr
+            | expr + "Eqv" + expr
+            | expr + "Imp" + expr
+            | ToTerm("Not") + expr
+            | ToTerm("-")   + expr
+            | ToTerm("+")   + expr
+            | ifExpr
+            | selectExpr
+            | primary;
+
+        // If/Then/Else — "If", "Then", "Else" are marked as punctuation below
+        ifExpr.Rule  = ToTerm("If") + expr + "Then" + expr + "Else" + expr
+                     | ToTerm("If") + expr + "Then" + expr;
+
+        // Select Case — structural keywords marked as punctuation below. Crystal's own
+        // spelling is "Select <expr> Case v: r ..." (no "Case" after "Select"); the
+        // "Select Case <expr>" form is the Basic-dialect/VB spelling. Both appear in
+        // real files, so accept both.
+        selectExpr.Rule     = ToTerm("Select") + "Case" + expr + caseClauseList
+                            | ToTerm("Select") + "Case" + expr + caseClauseList
+                              + "Default" + ":" + expr
+                            | ToTerm("Select") + expr + caseClauseList
+                            | ToTerm("Select") + expr + caseClauseList
+                              + "Default" + ":" + expr;
+        caseClauseList.Rule = MakePlusRule(caseClauseList, caseClause);
+        caseClause.Rule     = "Case" + "Else"     + ":" + expr   // Default/Else alias
+                            | "Case" + "Is" + "=" + expr + ":" + expr   // Case Is = val
+                            | "Case" + "Is" + "<>" + expr + ":" + expr
+                            | "Case" + "Is" + "<"  + expr + ":" + expr
+                            | "Case" + "Is" + ">"  + expr + ":" + expr
+                            | "Case" + "Is" + "<=" + expr + ":" + expr
+                            | "Case" + "Is" + ">=" + expr + ":" + expr
+                            | "Case" + caseValueList + ":" + expr;
+        caseValueList.Rule  = MakePlusRule(caseValueList, ToTerm(","), caseValue);
+        caseValue.Rule      = expr + "To" + expr
+                            | expr;
+
+        // ─── Operator precedence (higher number = tighter binding) ─────────────
+        RegisterOperators(11, Associativity.Right, "^");
+        RegisterOperators(10, Associativity.Left,  "*", "/");
+        // Crystal ranks \ below * and / and above Mod, as VB does: 7 \ 2 * 2 is 1 and
+        // 9 Mod 5 \ 2 is 1 (both syntaxes, measured in the Crystal runtime).
+        RegisterOperators(9,  Associativity.Left,  "\\");
+        RegisterOperators(8,  Associativity.Left,  "Mod");
+        RegisterOperators(7,  Associativity.Left,  "+", "-");
+        RegisterOperators(6,  Associativity.Left,  "&");
+        RegisterOperators(5,  Associativity.Left,  "=", "<>", "<", ">", "<=", ">=",
+                                                    "Like", "In");
+        RegisterOperators(4,  Associativity.Right, "Not");
+        RegisterOperators(3,  Associativity.Left,  "And");
+        RegisterOperators(2,  Associativity.Left,  "Xor");
+        RegisterOperators(1,  Associativity.Left,  "Or", "Eqv", "Imp");
+
+        // Unary minus/plus/not at same or higher than highest binary to avoid ambiguity
+        // Irony handles unary automatically by context; no extra registration needed.
+
+        // ─── Reserved words ───────────────────────────────────────────────────
+        // Variable-declaration keywords (Local/Global/Shared, the type names) are
+        // deliberately absent — see the varDecl note above: those formulas are meant to
+        // fail the parse so FormulaTranspiler's CrystalVarDecl guard can degrade them.
+        MarkReservedWords(
+            "If", "Then", "Else", "ElseIf", "Select", "Case", "Default", "End",
+            "In", "To", "Is", "And", "Or", "Not", "Xor", "Eqv", "Imp", "Mod", "Like",
+            "True", "False", "Null"
+        );
+
+        // ─── Structural keywords removed from parse tree ─────────────────────
+        // These are grammar scaffolding — their presence is implied by the node type.
+        MarkPunctuation(
+            ";", ",", ":", "(", ")", "[", "]",
+            "If", "Then", "Else",
+            "Select", "Case", "Default",
+            "Is", "To",
+            ".", "@", "#"
+        );
+
+        // Transparent single-child nodes — elided from tree
+        MarkTransient(program, stmt, primary, argListOpt, arg);
+
+        // ─── Comments ─────────────────────────────────────────────────────────
+        NonGrammarTerminals.Add(new CommentTerminal("lineComment", "//", "\n", "\r"));
+        NonGrammarTerminals.Add(new CommentTerminal("blockComment", "/*", "*/"));
+
+        this.Root = program;
+        this.LanguageFlags = LanguageFlags.NewLineBeforeEOF;
+    }
+}

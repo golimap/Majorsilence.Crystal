@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Majorsilence.Crystal.RptEngine.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Majorsilence.Crystal.Model\Majorsilence.Crystal.Model.csproj" />
+    <ProjectReference Include="..\Majorsilence.Crystal.Parser\Majorsilence.Crystal.Parser.csproj" />
+    <ProjectReference Include="..\Majorsilence.Crystal.Converter\Majorsilence.Crystal.Converter.csproj" />
+    <ProjectReference Include="..\Majorsilence.Crystal.Runtime\Majorsilence.Crystal.Runtime.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The cross-platform build of the engine; the plain RdlEngine package draws with System.Drawing, which is Windows-only. -->
+    <PackageReference Include="Majorsilence.Reporting.RdlEngine.SkiaSharp" Version="26.0.6" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>Renders Crystal Reports .rpt files (with runtime data/parameter/formula overrides) to PDF using Majorsilence.Crystal's own parser and converter plus the Majorsilence.Reporting RDL engine — no dependency on the real, licensed CrystalDecisions.CrystalReports.Engine runtime.</Description>
+  </PropertyGroup>
+
+</Project>

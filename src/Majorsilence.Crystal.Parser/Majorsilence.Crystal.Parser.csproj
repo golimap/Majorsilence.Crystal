@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Majorsilence.Crystal.Model\Majorsilence.Crystal.Model.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The date-format decode is exercised on hand-written record payloads: the byte
+         patterns a test needs are not all present in a corpus that may be committed. -->
+    <InternalsVisibleTo Include="Majorsilence.Crystal.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenMcdf" Version="3.1.4" />
+    <!-- Windows-only; used to rasterize WMF metafile logos to PNG (guarded by OperatingSystem.IsWindows()) -->
+    <PackageReference Include="System.Drawing.Common" Version="9.0.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>OLE reader, TSLV parser, AES-CFB128 decryptor, and zlib inflate for Crystal Reports .rpt files. Part of Majorsilence.Crystal, which reads .rpt files and converts them to SSRS RDL without the SAP Crystal Reports runtime.</Description>
+  </PropertyGroup>
+
+</Project>

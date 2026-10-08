@@ -1,0 +1,9 @@
+{
+  "inputDirectory": "C:\\VS2026\\majorsilence.crystal\\working-dir\\reports",
+  "outputDirectory": "C:\\VS2026\\majorsilence.crystal\\working-dir\\migrated",
+  "logDirectory": "C:\\VS2026\\majorsilence.crystal\\logs",
+  "databaseConnection": "Data Source=EDDEVELOPER;Initial Catalog=xtreme;Integrated Security=SSPI;TrustServerCertificate=True;User ID=USER;Password=PASSWORD;",
+  "windowsAuthentication": false,
+  "sqlQueries": {},
+  "recursive": true
+}
